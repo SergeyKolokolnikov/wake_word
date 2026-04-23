@@ -1,15 +1,9 @@
 # Beni wake-word model
 
-On-device wake-word detector trained to fire on the word **"Beni"** (and the
-phrase "Hey Beni"), targeting the Waveshare ESP32-S3-AUDIO-Board. The
-output artifact is a ~30 kB int8 TFLite graph consumed by the firmware's
+On-device wake-word detector that fires on the phrase **"Hey Beni"**,
+targeting the Waveshare ESP32-S3-AUDIO-Board. The output artifact is a
+~30 kB int8 streaming TFLite graph consumed by the firmware's
 `main/wake_word/` module via `esp-tflite-micro`.
-
-We deliberately train on the bare word "Beni" as well as "Hey Beni", so
-the end user does not have to prefix every sentence with a wake phrase —
-"Beni, recommend a recipe" must fire just like "Hey Beni, …". Short
-single-word triggers are on the edge of what wake-word models handle
-reliably, so the training set leans heavy on this pattern.
 
 ## Design choices, briefly
 
@@ -18,87 +12,95 @@ reliably, so the training set leans heavy on this pattern.
   Espressif's proprietary WakeNet because we want in-house control of the
   word list — Espressif's custom-model service is paid, gated, and a
   1–2 week round trip.
-- **Positives:** pure-synthetic via [Piper TTS](https://github.com/rhasspy/piper).
-  Many voices, speeds, pitches, pauses, punctuation variants. Eventually
-  supplemented by real recordings once we have a device in hand.
-- **Negatives:** Mozilla Common Voice English subset (short clips, varied
-  speakers) — the standard microWakeWord negative pool.
-- **Augmentation:** room-impulse-response convolution + MUSAN/ESC-50 noise
-  mixing at varied SNR, plus light speed/pitch perturbation. Standard
-  microWakeWord recipe.
+- **Positives:** synthetic via [piper-sample-generator](https://github.com/rhasspy/piper-sample-generator).
+  A fine-tuned LibriTTS voice that exposes prosody parameters, so one
+  phrase produces thousands of varied renderings out of the box. English
+  phonetic spelling ("hey beni") works fine — the detector is acoustic,
+  not linguistic.
+- **Negatives:** pre-generated negative spectrogram sets hosted by the
+  microWakeWord author on HuggingFace (`kahrendt/microwakeword`). Using
+  Kevin's sets guarantees the spectrogram front-end matches what the
+  firmware runs — the #1 way wake-word models regress is a
+  training-vs-inference front-end mismatch.
+- **Augmentation:** microWakeWord's built-in `Augmentation` with
+  MIT-impulse-response reverb, AudioSet background noise, and FMA music
+  backdrop. Standard recipe, no custom pipeline.
+- **Training backend:** the upstream CLI `python -m
+  microwakeword.model_train_eval` reading a YAML config. We deliberately
+  do **not** invoke the MixedNet class directly — the package is written
+  as a CLI trainer and the class/function API is not part of its
+  contract (it moves between versions).
 - **Why not always-on server-side STT?** Reviewed and rejected — costs
   $450–1800/device/month depending on STT vendor, streams full-day audio
   to the cloud (privacy + regulatory headache with vulnerable-adult
   users), and kills device battery. See conversation log 2026-04-23.
 
-## Expected quality (be honest with yourself)
+## Expected quality
 
 Pure-synthetic training gives:
 - False reject ~5–15 % on known-voice profiles, higher on elderly /
   strong-accent speakers (the actual target audience — this matters).
 - False accept a few times a day in quiet rooms, more with TV/radio.
-- Tunable by threshold; the firmware will expose one config knob.
+- Tunable by threshold; the firmware exposes one config knob.
 
-Plan to iterate once we have real recordings from the device. Do not
-ship V1 without a real-hardware listening test.
+Plan to iterate once we have real recordings from the device. **Do not
+ship V1 without a real-hardware listening test.**
 
 ## Where training runs: Google Colab
 
-The full pipeline lives inside **`train_beni.ipynb`** and is meant to run
-on a free Colab T4. Training the model locally is possible (TensorFlow
-supports Apple Metal on M-series chips) but slow — a Colab run finishes
-the whole pipeline end to end in ~30–45 minutes, and keeps ~3 GB of
-TF / Piper voices off the dev machine.
+The full pipeline lives inside **`train_beni.ipynb`** and is meant to
+run on a Colab T4 GPU. Training locally is possible but painful — a
+Colab run finishes end-to-end in ~1–2 h (most of it is the AudioSet
+download, not the training itself).
 
 **How to use it:**
 
-1. Commit this folder, push to GitHub.
-2. In Colab: `File → Open notebook → GitHub`, paste the repo URL, pick
-   `ml/wake_word/train_beni.ipynb`.
+1. Push this folder to GitHub (`SergeyKolokolnikov/wake_word`).
+2. In Colab: `File → Open notebook → GitHub`, pick
+   `train_beni.ipynb`.
 3. Runtime → Change runtime type → **T4 GPU**.
-4. `Run all`. The last cell auto-downloads `hey_beni.tflite` to your
-   computer.
-5. Drop that file into `firmware/main/wake_word/model/` and rebuild
-   firmware.
+4. `Run all`. After the install cell Colab will prompt to restart the
+   session — do it, then continue.
+5. The last cells trigger downloads of
+   `stream_state_internal_quant.tflite` and `hey_beni_model.h`. Drop
+   both into `firmware/main/wake_word/model/` and rebuild firmware.
 
 ## Directory layout
 
 ```
 ml/wake_word/
-├── README.md                ← this file
-├── train_beni.ipynb         ← Colab-first end-to-end training notebook
-├── scripts/                 ← Python helpers the notebook imports
-│   ├── synthesize_positives.py
-│   ├── fetch_negatives.py
-│   └── export_model.py
-└── artifacts/               ← committed .tflite models (tracked in git)
+├── README.md             ← this file
+├── train_beni.ipynb      ← Colab end-to-end training notebook
+├── scripts/
+│   └── dump_c_header.py  ← wraps the trained .tflite into a C header
+└── artifacts/            ← committed .tflite / .h outputs
 ```
 
-Dataset directories (`data/positive`, `data/negative`, `data/augmented`)
-exist only inside the Colab runtime and are never committed — the
-notebook rebuilds them deterministically from the committed seed.
+All intermediate data (positives, negatives, mmap features, trained
+checkpoints) lives only inside the Colab runtime; we commit only the
+final exported model, never raw data.
 
 ## Pipeline (what the notebook does)
 
-1. **Install deps** — `piper-tts`, `microwakeword`, `librosa`,
-   `datasets` (for Common Voice streaming).
-2. **Synthesize positives** — `scripts/synthesize_positives.py` loops
-   over ~15 Piper voices × {"beni", "hey beni", "beni,", "hey beni,"} ×
-   prosody variants (speaker scale, speed, noise) → ~3–5 k WAVs at
-   16 kHz mono.
-3. **Fetch negatives** — stream a ~20 h English subset of Mozilla
-   Common Voice via `datasets`.
-4. **Augment** — delegated to microWakeWord's built-in augmenter
-   (RIR + MUSAN noise + SNR sweep).
-5. **Train** — microWakeWord `MixedNet` config, ~30 epochs, GPU.
-6. **Export** — int8 TFLite → `hey_beni.tflite` + a short metrics
-   report (FRR at fixed FAR).
-7. **Download** — `files.download(...)` sends the .tflite to the host
-   browser; also saves to the notebook's `/content/artifacts/`.
+1. **Install microWakeWord** from git (it's not on PyPI) +
+   piper-sample-generator.
+2. **Generate 2000 "hey beni" WAVs** via piper-sample-generator.
+3. **Download augmentation sources** — MIT RIRs, one AudioSet shard,
+   a small FMA slice.
+4. **Configure `Clips` + `Augmentation`** to mix them.
+5. **Materialise augmented spectrograms** as RaggedMmap features
+   (train / val / test splits).
+6. **Download pre-generated negative spectrograms** from
+   `kahrendt/microwakeword` on HF (speech, dinner-party, no-speech,
+   plus a held-out dinner-party eval set).
+7. **Write `training_parameters.yaml`** describing the sampling mix.
+8. **Train MixedNet** via `python -m microwakeword.model_train_eval`.
+9. **Dump a C header** via `scripts/dump_c_header.py` so the firmware
+   can embed the model in flash.
 
 ## Reproducibility
 
-The notebook pins all pip versions in cell 1 and uses a fixed
-`RANDOM_SEED=42`. The resolved Piper voice list + Common Voice subset
-checksums are written to `artifacts/manifest.json`, which we commit
-alongside the .tflite.
+All versions pinned in the install cell. The notebook is fully
+sequential and idempotent — re-running from scratch produces the same
+tflite modulo Piper's sampling randomness (which we do **not** seed;
+for bit-identical reruns set `--random-seed` on piper-sample-generator).
