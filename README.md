@@ -12,9 +12,14 @@ targeting the Waveshare ESP32-S3-AUDIO-Board. The output artifact is a
   Espressif's proprietary WakeNet because we want in-house control of the
   word list — Espressif's custom-model service is paid, gated, and a
   1–2 week round trip.
-- **Positives:** synthetic via [piper-sample-generator](https://github.com/rhasspy/piper-sample-generator).
-  A fine-tuned LibriTTS voice that exposes prosody parameters, so one
-  phrase produces thousands of varied renderings out of the box. English
+- **Positives:** 10 000 synthetic clips via
+  [piper-sample-generator](https://github.com/rhasspy/piper-sample-generator).
+  The shipped `en_US-libritts_r-medium` voice is multi-speaker, so one
+  generation pass already covers hundreds of distinct vocal timbres.
+  On top of that we sample `--noise-scales` / `--length-scales` /
+  `--noise-scale-ws` from explicit ranges (instead of the package
+  defaults of one fixed value each) — adds expressiveness and
+  speaking-rate variation without needing a second voice model. English
   phonetic spelling ("hey beni") works fine — the detector is acoustic,
   not linguistic.
 - **Negatives:** pre-generated negative spectrogram sets hosted by the
